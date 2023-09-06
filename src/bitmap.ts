@@ -13,7 +13,7 @@ export const createExample = () => {
     for (let x = 0; x < width; x++) {
       const offset = y * width + x; // Calculate the offset for the current pixel
       // For simplicity, we create a gradient from black to white
-      const grayscaleValue = Math.floor((x / width) * 255); // Varies from 0 (black) to 255 (white)
+      const grayscaleValue = x > 50 ? 0 : 255 // Math.floor((x / width) * 255); // Varies from 0 (black) to 255 (white)
       // console.log(`${grayscaleValue}`);
       imageData[offset] = grayscaleValue;
     }
@@ -66,13 +66,15 @@ export const createGrayscaleBMP = (width: number, height: number, pixelData: Uin
   // const uint8Array = new Uint8Array(buffer);
 
   // Create a binary string from the Uint8Array
-  let binaryString = '';
-  for (let i = 0; i < view.getUint8.length; i++) {
-    binaryString += String.fromCharCode(view.getUint8(i));
-  }
+  // let binaryString = '';
+  // for (let i = 0; i < view.getUint8.length; i++) {
+  //   binaryString += String.fromCharCode(view.getUint8(i));
+  // }
 
   // Convert the binary string to a Base64-encoded string
-  const base64String = btoa(binaryString);
+  // const base64String = btoa(binaryString);
+  const dataArray = new Uint8Array(view.buffer);
+  const base64String = btoa(String.fromCharCode.apply(null, dataArray as unknown as number[]));
 
   return base64String
 }
