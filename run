@@ -1,0 +1,579 @@
+#!/bin/sh
+
+ANDROID_SECRETS_FOLDER=.secrets_android
+IOS_SECRETS_FOLDER=.secrets_ios
+
+
+android_key_create() {
+  if [ "$ANDROID_KEY_FILE" = "" ]; then echo "ANDROID_KEY_FILE can not be blank"; exit; fi
+  if [ "$ANDROID_ALIAS_NAME" = "" ]; then echo "ANDROID_ALIAS_NAME can not be blank"; exit; fi
+  if [ "$ANDROID_KEY_INFO" = "" ]; then echo "ANDROID_KEY_INFO can not be blank"; exit; fi
+  if [ "$ANDROID_KEYSTORE_PASSWORD" = "" ]; then echo "ANDROID_KEYSTORE_PASSWORD can not be blank"; exit; fi
+  if [ "$ANDROID_ALIAS_PASSWORD" = "" ]; then echo "ANDROID_ALIAS_PASSWORD can not be blank"; exit; fi
+
+  mkdir -p $PWD/$ANDROID_SECRETS_FOLDER
+
+  KEY_FILE_FULLPATH="$PWD/$ANDROID_SECRETS_FOLDER/$ANDROID_KEY_FILE"
+
+  keytool -genkey -v -keystore $KEY_FILE_FULLPATH \
+    -alias $ANDROID_ALIAS_NAME \
+    -keyalg RSA -keysize 2048 -validity 10000 \
+    -dname "$ANDROID_KEY_INFO" \
+    -storepass $ANDROID_KEYSTORE_PASSWORD -keypass $ANDROID_ALIAS_PASSWORD
+
+  ANDROID_KEYSTORE_BASE64=$(base64 $PWD/$ANDROID_SECRETS_FOLDER/$ANDROID_KEY_FILE | tr '\n' '~')
+  
+  echo "# Add this to your CI/CD environment variables\nANDROID_KEYSTORE_BASE64=$ANDROID_KEYSTORE_BASE64" > ${KEY_FILE_FULLPATH}.env
+}
+
+android_key_test() {
+  # read keystore file and password from environment file
+  keytool -v -list -keystore $ANDROID_KEY_FILE -storepass $ANDROID_KEYSTORE_PASSWORD -alias $ANDROID_ALIAS_NAME -keypass $ANDROID_ALIAS_PASSWORD | grep 'Valid from'
+  if [ $? = 0 ]; then echo "SUCCESS: Key and password match"; else echo "FAIL: Key test failed"; fi
+}
+
+# Patches the android app/build.gradle file to sign release builds with a production key and enable Hermes engine
+android_patch_app_build_gradle() {
+COMMENT="## Updates the android/app/build.gradle file. Replace the buildTypes block inside the android block with:
+   signingConfigs {
+        release {
+            Properties keyProperties = new Properties()
+            def keystorePropertiesFile = rootProject.file('key.properties')
+            if (keystorePropertiesFile.exists()) {
+                keyProperties.load(keystorePropertiesFile.newDataInputStream())
+                keyAlias keyProperties.getProperty('keyAlias')
+                keyPassword keyProperties.getProperty('keyPassword')
+                storeFile keyProperties['storeFile'] ? file(keyProperties['storeFile']) : null
+                storePassword keyProperties.getProperty('storePassword')
+            }
+        }
+   }
+   buildTypes {
+       release {
+           signingConfig signingConfigs.release
+       }
+   }
+"
+
+  APP_BUILD_FILE=./android/app/build.gradle
+  echo "Updating $APP_BUILD_FILE"
+  # Make backup of original file
+  if [ ! -f "${APP_BUILD_FILE}_original" ]; then cp $APP_BUILD_FILE ${APP_BUILD_FILE}_original; fi
+
+  # Update signingConfigs
+  export SEARCH="    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }"
+   export REPLACE="    signingConfigs {
+        // ### SCRIPTED PATCH
+        release {
+            Properties keyProperties = new Properties()
+            def keystorePropertiesFile = rootProject.file('key.properties')
+            if (keystorePropertiesFile.exists()) {
+                keyProperties.load(keystorePropertiesFile.newDataInputStream())
+                keyAlias keyProperties.getProperty('keyAlias')
+                keyPassword keyProperties.getProperty('keyPassword')
+                storeFile keyProperties['storeFile'] ? file(keyProperties['storeFile']) : null
+                storePassword keyProperties.getProperty('storePassword')
+            }
+        }
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }"
+  java -cp _tools/ android_multitool replace android/app/build.gradle
+
+  # Update buildTypes
+  export SEARCH="    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            // Caution! In production, you need to generate your own keystore file.
+            // see https://reactnative.dev/docs/signed-apk-android.
+            signingConfig signingConfigs.debug"
+  export REPLACE="    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            // ### SCRIPTED PATCH
+            signingConfig signingConfigs.release"
+  
+  java -cp _tools/ android_multitool replace android/app/build.gradle
+}
+
+android_key_add() {
+  echo "storePassword=$ANDROID_KEYSTORE_PASSWORD
+keyPassword=$ANDROID_ALIAS_PASSWORD
+keyAlias=$ANDROID_ALIAS_NAME
+storeFile=$PWD/$ANDROID_KEY_FILE
+" > $PWD/android/key.properties
+
+  FULL_KEYFILE_PATH=$PWD/$ANDROID_KEY_FILE
+  echo $FULL_KEYFILE_PATH
+  echo $ANDROID_KEYSTORE_BASE64 | tr '~' '\n' | base64 --decode > $FULL_KEYFILE_PATH
+}
+
+android_key_remove() {
+  FULL_KEYFILE_PATH=$PWD/$ANDROID_KEY_FILE
+  rm -f $FULL_KEYFILE_PATH
+}
+
+generate_android_icon() {
+  echo "## Generating Android icons"
+  SOURCE_ICON=./assets/icon.png
+  RESIZE_COMMAND="java -cp _tools/ android_multitool resize_image"
+
+  # Generate normal square
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-hdpi/ic_launcher.png 72
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-mdpi/ic_launcher.png 48
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-xhdpi/ic_launcher.png 96
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png 144
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png 192
+  # Generate rounded icons
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png 72 round
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png 48 round
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png 96 round
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png 144 round
+  $RESIZE_COMMAND $SOURCE_ICON android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png 192 round
+}
+
+
+ios_patch_podfile() {
+  IOS_POD_FILE=./ios/Podfile
+  echo "Updating $IOS_POD_FILE"
+  if [ ! -f "${IOS_POD_FILE}_original" ]; then cp $IOS_POD_FILE ${IOS_POD_FILE}_original; fi
+
+  awk '/:hermes_enabled => false/{gsub(/false/,"true")};{print}' ${IOS_POD_FILE}_original > $IOS_POD_FILE
+}
+
+ios_build_ipa() {
+
+echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+        <key>destination</key>
+        <string>export</string>
+        <key>method</key>
+        <string>app-store</string>
+        <key>provisioningProfiles</key>
+        <dict>
+                <key>$APP_BUNDLEID</key>
+                <string>$IOS_PROV_PROFILE_NAME</string>
+        </dict>
+        <key>signingCertificate</key>
+        <string>Apple Distribution</string>
+        <key>signingStyle</key>
+        <string>manual</string>
+        <key>stripSwiftSymbols</key>
+        <true/>
+        <key>teamID</key>
+        <string>$IOS_TEAM_ID</string>
+        <key>uploadSymbols</key>
+        <true/>
+</dict>
+</plist>" > $IOS_TMP_FOLDER/export_options.plist
+  flutter build ipa --release --export-options-plist=$IOS_TMP_FOLDER/export_options.plist --obfuscate --split-debug-info build/app/outputs/debug-ios/
+}
+
+ios_get_secrets() {
+  echo "Getting signing certificate and provisioning profile"
+  echo "$IOS_KEYCHAIN_PASSWORD" | gpg --batch --yes --passphrase-fd 0 ios_secrets.tgz.gpg
+  tar -zxvf ios_secrets.tgz --no-same-owner
+  rm ios_secrets.tgz
+
+  # Move provisioning profile to the right location
+  mkdir -pv ~/Library/MobileDevice/Provisioning\ Profiles
+  cp $IOS_TMP_FOLDER/*.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles
+
+  # DEBUG-TMP show folder contents
+  # ls -al $IOS_TMP_FOLDER
+}
+
+ios_key_add() {
+  echo "Adding signing certificate and provisioning profile"
+
+  ios_get_secrets
+
+  # output build/ios/iphoneos/Runner.app
+  # To list all identities: security find-identity -v -p codesigning
+  # security list-keychains
+  KEYCHAIN_FULLNAME="${IOS_KEYCHAIN_NAME}-db"
+
+  # create and append keychain to the search list
+  security create-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_FULLNAME"
+  security list-keychains -d user -s "$KEYCHAIN_FULLNAME" $(security list-keychains -d user | sed s/\"//g)
+  # Unlock the keychain
+  security set-keychain-settings -t 3600 -l "$KEYCHAIN_FULLNAME"
+  security unlock-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_FULLNAME"
+  
+  # Import certificate
+  # echo $IOS_CERT_P12_BASE64 | base64 --decode > $IOS_TMP_FOLDER/ios_cert.p12
+  security import $IOS_TMP_FOLDER/ios_cert_distribution.p12 -k "$KEYCHAIN_FULLNAME" -P "$IOS_DIST_CERT_P12_PASSWORD" -T "/usr/bin/codesign"
+  security import $IOS_TMP_FOLDER/ios_cert_development.p12 -k "$KEYCHAIN_FULLNAME" -P "$IOS_DEV_CERT_P12_PASSWORD" -T "/usr/bin/codesign"
+
+  # Check certificate was imported
+  security find-identity -v -p codesigning "$KEYCHAIN_FULLNAME"
+
+  # Detect the iOS identity
+  IOS_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_FULLNAME" | head -1 | grep '"' | sed -e 's/[^"]*"//' -e 's/".*//')
+  IOS_UUID=$(security find-identity -v -p codesigning "$KEYCHAIN_FULLNAME" | head -1 | grep '"' | awk '{print $2}')
+
+  # New requirement for MacOS 10.12
+  security set-key-partition-list -S apple-tool:,apple: -s -k $IOS_KEYCHAIN_PASSWORD $KEYCHAIN_FULLNAME
+
+  # Show signing keys
+  security find-identity -v -p codesigning
+
+  echo "$IOS_IDENTITY  $IOS_UUID"
+
+  # SIGN APP
+  # codesign -v -s "Apple Distribution: Rocket Lab Pty Ltd (YKXG58E5J6)" ./build/ios/iphoneos/Runner.app
+}
+
+ios_key_remove() {
+  KEYCHAIN_FULLNAME="${IOS_KEYCHAIN_NAME}-db"
+  security delete-keychain "$KEYCHAIN_FULLNAME"
+  security find-identity -v -p codesigning
+}
+
+ios_key_create() {
+  rm .ios_secrets/.DS_Store
+  tar -zcvf ios_secrets.tgz $IOS_TMP_FOLDER
+  echo "$IOS_KEYCHAIN_PASSWORD" | gpg --batch --yes --passphrase-fd 0 -c ios_secrets.tgz
+  rm ios_secrets.tgz
+}
+
+ios_upload_ipa() {
+  xcrun altool --upload-app --type ios -f build/ios/ipa/$IOS_IPA_FILE -u $IOS_UPLOAD_USER -p $IOS_UPLOAD_PASSWORD
+}
+
+generate_ios_icon() {
+  echo "## Generating IOS icons"
+  SOURCE_ICON=./assets/icon.png
+  RESIZE_COMMAND="java -cp _tools/ android_multitool resize_image"
+
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_20px.png 20
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_29px.png 29
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_40px.png 40
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_58px.png 58
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_60px.png 60
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_76px.png 76
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_80px.png 80
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_87px.png 87
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_120px.png 120
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_152px.png 152
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_167px.png 167
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_180px.png 180
+  $RESIZE_COMMAND $SOURCE_ICON ios/demoapp/Images.xcassets/AppIcon.appiconset/appicon_1024px.png 1024
+
+  # Update content index to use icons:
+  APPNAME=$(awk '/  "name": "*"/{ gsub(/"/,"", $2); gsub(/\,/,"", $2); print $2}' app.json)
+  CONTENT_JSON="ios/$APPNAME/Images.xcassets/AppIcon.appiconset/Contents.json"
+  FIXED_CONTENT='{"images":[{"filename":"appicon_40px.png","idiom":"iphone","scale":"2x","size":"20x20"},{"filename":"appicon_60px.png","idiom":"iphone","scale":"3x","size":"20x20"},{"filename":"appicon_58px.png","idiom":"iphone","scale":"2x","size":"29x29"},{"filename":"appicon_87px.png","idiom":"iphone","scale":"3x","size":"29x29"},{"filename":"appicon_80px.png","idiom":"iphone","scale":"2x","size":"40x40"},{"filename":"appicon_120px.png","idiom":"iphone","scale":"3x","size":"40x40"},{"filename":"appicon_120px.png","idiom":"iphone","scale":"2x","size":"60x60"},{"filename":"appicon_180px.png","idiom":"iphone","scale":"3x","size":"60x60"},{"filename":"appicon_20px.png","idiom":"ipad","scale":"1x","size":"20x20"},{"filename":"appicon_40px.png","idiom":"ipad","scale":"2x","size":"20x20"},{"filename":"appicon_29px.png","idiom":"ipad","scale":"1x","size":"29x29"},{"filename":"appicon_58px.png","idiom":"ipad","scale":"2x","size":"29x29"},{"filename":"appicon_40px.png","idiom":"ipad","scale":"1x","size":"40x40"},{"filename":"appicon_80px.png","idiom":"ipad","scale":"2x","size":"40x40"},{"filename":"appicon_76px.png","idiom":"ipad","scale":"1x","size":"76x76"},{"filename":"appicon_152px.png","idiom":"ipad","scale":"2x","size":"76x76"},{"filename":"appicon_167px.png","idiom":"ipad","scale":"2x","size":"83.5x83.5"},{"filename":"appicon_1024px.png","idiom":"ios-marketing","scale":"1x","size":"1024x1024"}],"info":{"author":"xcode","version":1}}'
+  echo $FIXED_CONTENT > $CONTENT_JSON
+}
+
+generate_app_icon() {
+  generate_android_icon
+  generate_ios_icon
+}
+
+
+generate_svg_icons() {
+  rm ./src/components/icons/*.ts? ./src/components/svgimages/*.ts?
+  ./node_modules/.bin/svgr --native --typescript --out-dir ./src/components/icons ./src/assets/icons/
+  ./node_modules/.bin/svgr --native --typescript --out-dir ./src/components/svgimages ./src/assets/svg/
+}
+
+
+# Macos version of sed does not have infile replace option -i so we need this wrapper
+portable_file_replace() {
+  FILENAME="$1"
+  SEARCH_TERM="$2"
+  REPLACE_TERM="$3"
+  # FOR_DEBUG: echo "Search and replacing $SEARCH_TERM => $REPLACE_TERM  in  $FILENAME"
+  sed "s/$SEARCH_TERM/$REPLACE_TERM/g" $FILENAME > ${FILENAME}_tmp
+  mv -f ${FILENAME}_tmp $FILENAME
+  # cp ${FILENAME}_tmp $FILENAME
+  # rm ${FILENAME}_tmp
+}
+
+android_change_bundleid() {
+  NEW_BUNDLEID=$1
+  NEW_BUNDLEPATH=$2
+  BUNDLEID=$3
+  BUNDLEPATH=$4
+  # FOR_DEBUG echo ">> DEBUG: $NEW_BUNDLEID $NEW_BUNDLEPATH $BUNDLEID $BUNDLEPATH"
+
+  # create java folder structure and move files to it
+  mkdir -p android/app/src/debug/java/$NEW_BUNDLEPATH
+  mkdir -p android/app/src/main/java/$NEW_BUNDLEPATH
+  cp -R android/app/src/debug/java/$BUNDLEPATH/* android/app/src/debug/java/$NEW_BUNDLEPATH/
+  cp -R android/app/src/main/java/$BUNDLEPATH/* android/app/src/main/java/$NEW_BUNDLEPATH/
+  rm -rf android/app/src/debug/java/$BUNDLEPATH android/app/src/main/java/$BUNDLEPATH
+
+  # com.example.app becomes com\.example\.app for the search expression
+  SEARCH_BUNDLEID=$(awk -v str=$BUNDLEID 'BEGIN { gsub(/\./,"\\\.", str); print str}')
+  grep -lr "$BUNDLEID" ./android ./ios | while read filename
+  do
+    portable_file_replace  "$filename" $SEARCH_BUNDLEID $NEW_BUNDLEID
+  done
+}
+
+ios_change_bundleid() {
+  NEW_BUNDLEID=$1
+  APPNAME=$(awk '/  "name": "*"/{ gsub(/"/,"", $2); gsub(/\,/,"", $2); print $2}' app.json)
+  IOS_PROJECT_FILE="ios/$APPNAME.xcodeproj/project.pbxproj"
+  # IOS_PROJECT_FILE=$(find ./ios -name '*.pbxproj')
+
+  echo "Updating $IOS_PROJECT_FILE  with new bundleid: $NEW_BUNDLEID"
+
+  sed "s/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = \"$NEW_BUNDLEID\";/g" $IOS_PROJECT_FILE > ${IOS_PROJECT_FILE}_tmp
+  mv -f ${IOS_PROJECT_FILE}_tmp $IOS_PROJECT_FILE
+}
+
+app_change_bundleid() {
+  #   ./run-app rename com.example.myfunkyapp myfunkyapp "My App"
+  NEW_BUNDLEID=$1
+  NEW_BUNDLEPATH=$(awk -v str=$NEW_BUNDLEID 'BEGIN { gsub(/\./,"/", str); print str}')
+  # get current bundle id for android
+  BUNDLEID=$(awk '/applicationId "*"/{ gsub(/"/,"", $2); print $2}' android/app/build.gradle)
+  BUNDLEPATH=$(awk -v str=$BUNDLEID 'BEGIN { gsub(/\./,"/", str); print str}')
+
+  # FOR_DEBUG; echo "$APP_NAME\n$BUNDLEID\n$BUNDLEPATH\n$NEW_BUNDLEPATH"
+
+  # Change bundle ID if it is different
+  if [ "$NEW_BUNDLEID" != "$BUNDLEID" ]; then
+    echo "Changing bundle ID: $BUNDLEID => $NEW_BUNDLEID"
+    android_change_bundleid $NEW_BUNDLEID $NEW_BUNDLEPATH $BUNDLEID $BUNDLEPATH
+    ios_change_bundleid $NEW_BUNDLEID
+  fi
+}
+
+app_change_app_name() {
+  NEW_APPNAME=$1
+  # get current app name
+  APPNAME=$(awk '/  "name": "*"/{ gsub(/"/,"", $2); gsub(/\,/,"", $2); print $2}' app.json)
+
+  # update file contents
+  grep -lr "$APPNAME" ./android ./ios package.json app.json | while read filename
+  do
+    portable_file_replace  "$filename" $APPNAME $NEW_APPNAME
+  done
+
+  # rename known ios folders
+  mv ios/$APPNAME ios/$NEW_APPNAME
+  mv ios/${APPNAME}Tests ios/${NEW_APPNAME}Tests
+  mv ios/${APPNAME}.xcodeproj ios/${NEW_APPNAME}.xcodeproj
+  # rename known ios files
+  mv ios/${NEW_APPNAME}Tests/${APPNAME}Tests.m ios/${NEW_APPNAME}Tests/${NEW_APPNAME}Tests.m
+  mv ios/$NEW_APPNAME.xcodeproj/xcshareddata/xcschemes/$APPNAME.xcscheme ios/$NEW_APPNAME.xcodeproj/xcshareddata/xcschemes/$NEW_APPNAME.xcscheme
+}
+
+update_app_label() {
+  ICON_NAME="$1"
+  echo "New icon name will be: $ICON_NAME"
+   # get current app name
+  APPNAME=$(awk '/  "name": "*"/{ gsub(/"/,"", $2); gsub(/\,/,"", $2); print $2}' app.json)
+  # android
+  portable_file_replace android/app/src/main/res/values/strings.xml "<string name=\"app_name\">.*<\/string>" "<string name=\"app_name\">$ICON_NAME<\/string>"
+  # ios
+  plutil -replace CFBundleDisplayName -string "$ICON_NAME" $PWD/ios/$APPNAME/Info.plist
+}
+
+app_rename_all() {
+  if [ "$3" = "" ]; then echo "Usage <com.bundle.id> <app_name> \"Icon Name\""; exit; fi
+
+  # must do bundleid first since it is longer than app name
+  app_change_bundleid $1
+  app_change_app_name $2
+  # icon name can be changed last since it modifies known specific files
+  update_app_label "$3"
+}
+
+# Changes IOS splash screen to a single color before react native executes
+# Best to keep the splash screen in react native code
+update_ios_splash() {
+  HEXCOLOR=$1
+  COLOR_RED=$(printf "%d" "0x${HEXCOLOR:0:2}")
+  COLOR_GREEN=$(printf "%d" "0x${HEXCOLOR:2:2}")
+  COLOR_BLUE=$(printf "%d" "0x${HEXCOLOR:4:2}")
+  DECIMAL_RED=$( awk "BEGIN{print $COLOR_RED / 255.0}" )
+  DECIMAL_GREEN=$( awk "BEGIN{print $COLOR_GREEN / 255.0}" )
+  DECIMAL_BLUE=$( awk "BEGIN{print $COLOR_BLUE / 255.0}" )
+
+  APPNAME=$(awk '/  "name": "*"/{ gsub(/"/,"", $2); gsub(/\,/,"", $2); print $2}' app.json)
+
+  NEW_LAUNCHSCREEN_FILE="ios/$APPNAME/LaunchScreen.storyboard"
+  APP_DELEGATE="ios/$APPNAME/AppDelegate.mm"
+
+  awk -v red=$COLOR_RED -v green=$COLOR_GREEN -v blue=$COLOR_BLUE \
+    '{if ($0 ~ /rootView.backgroundColor/) {printf "    rootView.backgroundColor = [[UIColor alloc] initWithRed:%f green:%f blue:%f alpha:1];\n", (red/255.0), (green/255.0), (blue/255.0);} else {print} }' \
+    $APP_DELEGATE > ${APP_DELEGATE}_tmp
+  mv ${APP_DELEGATE}_tmp $APP_DELEGATE
+
+  echo '<?xml version="1.0" encoding="UTF-8"?>
+<document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="19455" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="01J-lp-oVM">
+    <device id="retina4_7" orientation="portrait" appearance="light"/>
+    <dependencies>
+        <deployment identifier="iOS"/>
+        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="19454"/>
+        <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+        <capability name="documents saved in the Xcode 8 format" minToolsVersion="8.0"/>
+    </dependencies>
+    <scenes>
+        <!--View Controller-->
+        <scene sceneID="EHf-IW-A2E">
+            <objects>
+                <viewController id="01J-lp-oVM" sceneMemberID="viewController">
+                    <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
+                        <rect key="frame" x="0.0" y="0.0" width="375" height="667"/>
+                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                        <viewLayoutGuide key="safeArea" id="Bcu-3y-fUS"/>
+                        <color key="backgroundColor" red="'$DECIMAL_RED'" green="'$DECIMAL_GREEN'" blue="'$DECIMAL_BLUE'" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                    </view>
+                </viewController>
+                <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>
+            </objects>
+            <point key="canvasLocation" x="52.173913043478265" y="375"/>
+        </scene>
+    </scenes>
+</document>
+' > $NEW_LAUNCHSCREEN_FILE
+}
+
+update_android_splash() {
+  HEXCOLOR=$1
+  STRINGS_FILE=android/app/src/main/res/values/strings.xml
+  grep 'app_background_color' $STRINGS_FILE > /dev/null
+  if [ $? != 0 ]; then
+    echo "Updating strings $HEXCOLOR"
+    export SEARCH="</resources>"
+    export REPLACE="    <color name=\"app_background_color\">#$HEXCOLOR</color>
+</resources>"
+    java -cp _tools/ android_multitool replace $STRINGS_FILE
+  else
+    awk -v hexcolor=$HEXCOLOR \
+      '{if ($0 ~ /app_background_color/) {printf "    <color name=\"app_background_color\">#%s</color>\n", hexcolor;} else {print} }' \
+      $STRINGS_FILE > ${STRINGS_FILE}_tmp
+    mv ${STRINGS_FILE}_tmp $STRINGS_FILE
+  fi
+
+  STYLES_FILE=android/app/src/main/res/values/styles.xml
+  grep 'app_background_color' $STYLES_FILE > /dev/null
+  if [ $? != 0 ]; then
+    export SEARCH="<!-- Customize your theme here. -->"
+    export REPLACE="<!-- Customize your theme here. -->
+        <item name=\"android:windowBackground\">@color/app_background_color</item>"
+    java -cp _tools/ android_multitool replace $STYLES_FILE
+  fi
+}
+
+update_app_splash() {
+  if [ "$1" = "" ]; then
+    echo "Usage ./run update-app-splash <rrggbb>\n  where rrggbb is a hex value";
+    exit
+  fi
+
+  update_ios_splash $1
+  update_android_splash $1
+}
+
+increase_watchers() {
+  sysctl fs.inotify.max_user_instances=256
+  sysctl fs.inotify.max_user_watches=131070
+  sysctl -p
+}
+
+check_file_watchers() {
+  if [ -f "/proc/sys/fs/inotify/max_user_watches" ]; then
+    CURRENT_LIMIT=$(cat /proc/sys/fs/inotify/max_user_watches)
+    if [ $CURRENT_LIMIT -lt 131070 ]; then
+      echo "WARNING: file watch limit below threshold.  Current value: $CURRENT_LIMIT"
+      echo "type sudo ./run increase-watchers  to increase limit"
+      exit
+    fi
+  fi
+}
+
+app_test() {
+  HEXCOLOR=$1
+  # convert hex to decimal
+  COLOR_RED=$(printf "%d" "0x${HEXCOLOR:0:2}")
+  COLOR_GREEN=$(printf "%d" "0x${HEXCOLOR:2:2}")
+  COLOR_BLUE=$(printf "%d" "0x${HEXCOLOR:4:2}")
+  echo $COLOR_RED
+  echo $COLOR_GREEN
+  echo $COLOR_BLUE
+}
+
+# Compile multitool if it does not exist
+if [ ! -f _tools/android_multitool.class ]; then javac _tools/android_multitool.java; fi
+
+# Check linux system requirements
+if [ "$1" = "increase-watchers" ]; then increase_watchers; exit; fi
+check_file_watchers
+
+# read environment from a file
+if [ -f ./env.settings ]; then . ./env.settings; fi
+if [ -f ./.env ]; then . ./.env; fi
+
+# IOS management scripts
+if [ "$1" = "ios-build" ]; then ios_build_ipa; exit; fi
+if [ "$1" = "ios-key-add" ]; then ios_key_add; exit; fi
+if [ "$1" = "ios-key-remove" ]; then ios_key_remove; exit; fi
+if [ "$1" = "ios-key-check" ]; then codesign -dvvv $2; exit; fi
+if [ "$1" = "ios-key-test" ]; then ios_get_secrets; exit; fi
+if [ "$1" = "ios-key-create" ]; then ios_key_create; exit; fi
+if [ "$1" = "ios-upload-ipa" ]; then ios_upload_ipa; exit; fi
+
+# Android management scripts
+if [ "$1" = "android-key-create" ]; then android_key_create; exit; fi
+if [ "$1" = "android-key-test" ]; then android_key_test; exit; fi
+if [ "$1" = "android-key-add" ]; then android_key_add; exit; fi
+if [ "$1" = "android-key-remove" ]; then android_key_remove; exit; fi
+if [ "$1" = "android-key-check" ]; then jarsigner -verify -verbose -certs $2; exit; fi
+
+# ios_patch_podfile does not do anything yet
+if [ "$1" = "patch" ]; then android_patch_app_build_gradle; exit; fi
+if [ "$1" = "update-app-icon" ]; then generate_app_icon; exit; fi
+if [ "$1" = "update-app-label" ]; then update_app_label "$2"; exit; fi
+if [ "$1" = "update-app-splash" ]; then update_app_splash $2 $3 $4; exit; fi
+
+if [ "$1" = "update-icons" ]; then generate_svg_icons; exit; fi
+
+if [ "$1" = "rename-all" ]; then app_rename_all "$2" "$3" "$4"; exit; fi
+if [ "$1" = "rename-bundleid" ]; then app_change_bundleid "$2"; exit; fi
+if [ "$1" = "rename-appname" ]; then app_change_app_name "$2"; exit; fi
+
+if [ "$1" = "test" ]; then app_test "$2"; exit; fi
+
+if [ "$1" = "android" ]; then ./node_modules/.bin/react-native run-android --variant debug --deviceId "emulator-5554"; exit; fi
+if [ "$1" = "ios" ]; then ./node_modules/.bin/react-native run-ios --simulator "iPhone 11"; exit; fi
+
+if [ "$1" = "clean" ]; then
+  cd android; ./gradlew clean; cd ..
+  cd ios; rm -rf build/; xcodebuild clean; cd ..
+  exit
+fi
+
+if [ "$1" = "update-template" ]; then
+  cd ../react-native-template; rm -rf src/ assets/ index.js readme.md add_modules.sh ; cd ../demoapp
+  cp -R ./src ./assets index.js readme.md add_modules.sh ../react-native-template/
+  echo "done!"
+  exit
+fi
+
+
+echo "Command not found"
